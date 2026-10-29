@@ -1,0 +1,352 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Trust helpers
+    //
+    // Administrator authority comes from a Firebase custom claim provisioned
+    // with the Admin SDK. Client code can never write this claim. The app also
+    // requires users/{uid}.role == "ADMIN", but rules trust only the claim.
+    // ---------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && 'role' in request.auth.token
+        && request.auth.token.role == 'ADMIN';
+    }
+
+    function userPath(userId) {
+      return /databases/$(database)/documents/users/$(userId);
+    }
+
+    function userExists(userId) {
+      return exists(userPath(userId));
+    }
+
+    function userData(userId) {
+      return get(userPath(userId)).data;
+    }
+
+    function isResident() {
+      return signedIn()
+        && userExists(uid())
+        && userData(uid()).role == 'RESIDENT';
+    }
+
+    function isVerifiedResident() {
+      return isResident()
+        && userData(uid()).verificationStatus == 'APPROVED';
+    }
+
+    function canParticipate() {
+      return isAdmin() || isVerifiedResident();
+    }
+
+    function isOwner(userId) {
+      return signedIn() && uid() == userId;
+    }
+
+    function validText(value, minimum, maximum) {
+      return value is string
+        && value.size() >= minimum
+        && value.size() <= maximum;
+    }
+
+    function onlyFields(allowed) {
+      return request.resource.data.diff(resource.data)
+        .affectedKeys()
+        .hasOnly(allowed);
+    }
+
+    function validProfileShape() {
+      return validText(request.resource.data.fullName, 2, 80)
+        && validText(request.resource.data.email, 3, 200)
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 30
+        && validText(request.resource.data.address, 1, 300)
+        && validText(request.resource.data.purok, 1, 80)
+        && request.resource.data.role is string
+        && request.resource.data.verificationStatus is string
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp;
+    }
+
+    function validVerificationShape() {
+      return validText(request.resource.data.applicantName, 2, 120)
+        && validText(request.resource.data.applicantEmail, 3, 200)
+        && request.resource.data.applicantPhone is string
+        && request.resource.data.applicantPhone.size() <= 30
+        && validText(request.resource.data.address, 1, 300)
+        && validText(request.resource.data.purok, 1, 80)
+        && request.resource.data.yearsOfResidency is int
+        && request.resource.data.yearsOfResidency >= 0
+        && request.resource.data.yearsOfResidency <= 120
+        && request.resource.data.idType is string
+        && validText(request.resource.data.idNumber, 1, 80)
+        && request.resource.data.documentUrl is string
+        && request.resource.data.documentUrl.size() > 0
+        && request.resource.data.documentUrl.size() <= 2048
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.submittedAt is timestamp;
+    }
+
+    // ---------------------------------------------------------------------
+    // User profiles
+    // ---------------------------------------------------------------------
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+
+      // A public sign-up can only create a resident who still needs to submit
+      // residency verification. Admin profiles are created outside the client.
+      allow create: if isOwner(userId)
+        && validProfileShape()
+        && request.resource.data.keys().hasOnly([
+          'fullName', 'email', 'phone', 'address', 'purok', 'role',
+          'verificationStatus', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.role == 'RESIDENT'
+        && request.resource.data.verificationStatus == 'NOT_SUBMITTED';
+
+      // Owners may edit contact details. The only verification change they may
+      // make is submitting/re-submitting their own application as PENDING.
+      // Only an administrator claim may approve or reject residency.
+      allow update: if validProfileShape()
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.createdAt == resource.data.createdAt
+        && onlyFields([
+          'fullName', 'phone', 'address', 'purok', 'updatedAt',
+          'verificationStatus'
+        ])
+        && (
+          (
+            isOwner(userId)
+            && (
+              request.resource.data.verificationStatus == resource.data.verificationStatus
+              || (
+                isResident()
+                && request.resource.data.verificationStatus == 'PENDING'
+                && resource.data.verificationStatus != 'APPROVED'
+              )
+            )
+          )
+          || (
+            isAdmin()
+            && request.resource.data.verificationStatus
+              in ['PENDING', 'APPROVED', 'REJECTED']
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Residency verification applications
+    // ---------------------------------------------------------------------
+
+    match /verifications/{verificationId} {
+      allow get: if isOwner(verificationId) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isOwner(request.resource.data.userId)
+        && request.resource.data.userId == verificationId
+        && validVerificationShape()
+        && request.resource.data.keys().hasOnly([
+          'userId', 'applicantName', 'applicantEmail', 'applicantPhone',
+          'address', 'purok', 'yearsOfResidency', 'idType', 'idNumber',
+          'documentUrl', 'documentName', 'status', 'submittedAt'
+        ]);
+
+      // A resident may replace their own application while it stays PENDING.
+      // Administrators may only record a review decision and reviewer metadata.
+      allow update: if (
+          isOwner(resource.data.userId)
+          && request.resource.data.userId == resource.data.userId
+          && validVerificationShape()
+        )
+        || (
+          isAdmin()
+          && request.resource.data.userId == resource.data.userId
+          && request.resource.data.status in ['APPROVED', 'REJECTED']
+          && request.resource.data.reviewerId == uid()
+          && validText(request.resource.data.reviewerName, 2, 120)
+          && request.resource.data.reviewedAt is timestamp
+          && onlyFields([
+            'status', 'reviewedAt', 'reviewerId', 'reviewerName', 'reviewNote'
+          ])
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Community reports
+    // ---------------------------------------------------------------------
+
+    match /complaints/{complaintId} {
+      allow get, list: if isAdmin() || isResident();
+
+      allow create: if isVerifiedResident()
+        && request.resource.data.authorId == uid()
+        && request.resource.data.authorName == userData(uid()).fullName
+        && request.resource.data.authorPurok == userData(uid()).purok
+        && request.resource.data.keys().hasOnly([
+          'ticketNumber', 'title', 'description', 'category', 'status',
+          'priority', 'authorId', 'authorName', 'authorPurok', 'address',
+          'landmark', 'latitude', 'longitude', 'photoUrls', 'createdAt',
+          'updatedAt'
+        ])
+        && validText(request.resource.data.title, 8, 90)
+        && validText(request.resource.data.description, 20, 1200)
+        && request.resource.data.ticketNumber is string
+        && request.resource.data.category is string
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.priority == 'MEDIUM'
+        && validText(request.resource.data.address, 1, 300)
+        && request.resource.data.landmark is string
+        && request.resource.data.landmark.size() <= 200
+        && request.resource.data.photoUrls is list
+        && request.resource.data.photoUrls.size() <= 3
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp
+        && (
+          !('latitude' in request.resource.data)
+          || request.resource.data.latitude is number
+        )
+        && (
+          !('longitude' in request.resource.data)
+          || request.resource.data.longitude is number
+        );
+
+      // Barangay staff can change only the response state. Report authorship
+      // and resident-provided details remain immutable.
+      allow update: if isAdmin()
+        && onlyFields(['status', 'priority', 'updatedAt'])
+        && request.resource.data.status
+          in ['PENDING', 'ACKNOWLEDGED', 'IN_PROGRESS', 'RESOLVED', 'REJECTED']
+        && request.resource.data.priority
+          in ['LOW', 'MEDIUM', 'HIGH', 'URGENT']
+        && request.resource.data.updatedAt is timestamp;
+
+      allow delete: if false;
+
+      // Official timeline entries are written by administrators. The resident
+      // who files a report may also create the single initial "received" entry
+      // from the same client batch.
+      match /updates/{updateId} {
+        allow read: if isAdmin() || isResident();
+
+        allow create: if (
+            isAdmin()
+            && request.resource.data.isOfficial == true
+            && request.resource.data.authorId == uid()
+            && request.resource.data.complaintId == complaintId
+            && request.resource.data.status
+              in ['PENDING', 'ACKNOWLEDGED', 'IN_PROGRESS', 'RESOLVED', 'REJECTED']
+            && validText(request.resource.data.authorName, 2, 120)
+            && validText(request.resource.data.note, 1, 600)
+          )
+          || (
+            isVerifiedResident()
+            && updateId == 'initial'
+            && request.resource.data.complaintId == complaintId
+            && request.resource.data.status == 'PENDING'
+            && request.resource.data.isOfficial == false
+            && validText(request.resource.data.note, 1, 600)
+            && (
+              !exists(
+                /databases/$(database)/documents/complaints/$(complaintId)
+              )
+              || get(
+                /databases/$(database)/documents/complaints/$(complaintId)
+              ).data.authorId == uid()
+            )
+          );
+
+        allow update, delete: if false;
+      }
+
+      // Residents and staff can discuss a report. Author identity and role are
+      // checked against the caller's profile and claim.
+      match /comments/{commentId} {
+        allow read: if isAdmin() || isResident();
+
+        allow create: if canParticipate()
+          && request.resource.data.complaintId == complaintId
+          && request.resource.data.authorId == uid()
+          && request.resource.data.authorName == userData(uid()).fullName
+          && request.resource.data.keys().hasOnly([
+            'complaintId', 'authorId', 'authorName', 'authorRole', 'text',
+            'createdAt'
+          ])
+          && (
+            (
+              isAdmin()
+              && request.resource.data.authorRole == 'ADMIN'
+            )
+            || (
+              isVerifiedResident()
+              && request.resource.data.authorRole == 'RESIDENT'
+            )
+          )
+          && validText(request.resource.data.text, 1, 1000)
+          && request.resource.data.createdAt is timestamp;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Followed reports
+    // ---------------------------------------------------------------------
+
+    match /follows/{followId} {
+      allow get: if isAdmin() || isOwner(resource.data.userId);
+      allow list: if isAdmin()
+        || (isResident() && resource.data.userId == uid());
+
+      allow create: if isVerifiedResident()
+        && request.resource.data.userId == uid()
+        && request.resource.data.keys().hasOnly([
+          'userId', 'complaintId', 'createdAt'
+        ])
+        && request.resource.data.complaintId is string
+        && followId == request.resource.data.userId + '_' + request.resource.data.complaintId
+        && request.resource.data.createdAt is timestamp;
+
+      allow delete: if isVerifiedResident()
+        && resource.data.userId == uid();
+
+      allow update: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // In-app notifications
+    //
+    // Notification documents are created by trusted Cloud Functions (Admin SDK
+    // bypasses rules). Clients may only read their own and mark them as read.
+    // ---------------------------------------------------------------------
+
+    match /users/{userId}/notifications/{notificationId} {
+      allow read: if isOwner(userId);
+      allow update: if isOwner(userId)
+        && onlyFields(['isRead'])
+        && request.resource.data.isRead == true;
+      allow create, delete: if false;
+    }
+
+    // Everything else is denied by default.
+  }
+}

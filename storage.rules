@@ -1,0 +1,70 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && 'role' in request.auth.token
+        && request.auth.token.role == 'ADMIN';
+    }
+
+    function profilePath(userId) {
+      return /databases/(default)/documents/users/$(userId);
+    }
+
+    function isResidentAccount() {
+      return signedIn()
+        && firestore.exists(profilePath(request.auth.uid))
+        && firestore.get(profilePath(request.auth.uid)).data.role == 'RESIDENT';
+    }
+
+    function isVerifiedResident() {
+      return isResidentAccount()
+        && firestore.get(profilePath(request.auth.uid)).data.verificationStatus == 'APPROVED';
+    }
+
+    function isImage() {
+      return request.resource.contentType.matches('image/.*');
+    }
+
+    function isImageOrPdf() {
+      return request.resource.contentType.matches('image/.*')
+        || request.resource.contentType == 'application/pdf';
+    }
+
+    // Community report photos are visible to signed-in residents and staff.
+    match /complaints/{userId}/{fileName} {
+      allow read: if signedIn();
+
+      allow create, update: if isVerifiedResident()
+        && request.auth.uid == userId
+        && request.resource.size < 10 * 1024 * 1024
+        && isImage();
+
+      allow delete: if false;
+    }
+
+    // Government IDs are private to the applicant and administrators.
+    match /verifications/{userId}/{fileName} {
+      allow read: if (signedIn() && request.auth.uid == userId)
+        || isAdmin();
+
+      allow create, update: if isResidentAccount()
+        && request.auth.uid == userId
+        && request.resource.size < 10 * 1024 * 1024
+        && isImageOrPdf();
+
+      allow delete: if false;
+    }
+
+    // Deny every other path.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="muni_background">#F7F4EE</color>
+    <color name="muni_primary">#0F5B4E</color>
+    <color name="muni_status_bar">#F7F4EE</color>
+</resources>
